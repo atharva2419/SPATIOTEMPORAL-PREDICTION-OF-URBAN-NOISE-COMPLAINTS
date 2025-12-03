@@ -28,10 +28,17 @@ from xgboost import XGBRegressor
 
 # ---------------- CONFIG: tuned to your REAL columns ----------------
 CONFIG = {
-    # 311 noise dataset (all years or subset)
-    "NYC311_PATH": "21-22_Test.csv",
+    # 311 noise datasets (already filtered to noise-only, cleaned columns)
+    "NYC311_PATHS": [
+        "cleaned_2021_2022.csv",
+        "cleaned_2023_2024.csv",
+        "cleaned_2025.csv",
+    ],
 
-    # DOB construction permit file (subset is fine)
+    # keep this for backward compatibility; not used when NYC311_PATHS is given
+    "NYC311_PATH": None,
+
+    # DOB construction permit file (same as before)
     "DOB_PERMIT_PATH": "dob_Permit_Test.xlsx",
 
     # 311 column names in CSV
@@ -45,13 +52,13 @@ CONFIG = {
     "DOB_COL_ZIP": "Zip Code",
     "DOB_COL_ISSUE_DATE": "Issuance Date",
     "DOB_COL_EXPIRY_DATE": "Expiration Date",
-    "DOB_COL_JOB_TYPE": "Job Type",      # we treat Job Type as construction type
-    "DOB_COL_AFTER_HOURS": None,         # no explicit after-hours field
+    "DOB_COL_JOB_TYPE": "Job Type",
+    "DOB_COL_AFTER_HOURS": None,
 
-    # General
-    "NOISE_KEYWORD": "Noise",            # filter complaint_type containing this
-    "TRAIN_END_DATE": "2021-01-31",
-    "TEST_END_DATE": "2021-02-08",
+    # General – NOW USING ALL YEARS 2021–2024 AS TRAIN, 2025 AS TEST
+    "NOISE_KEYWORD": "Noise",            # still ok even if already filtered
+    "TRAIN_END_DATE": "2024-12-31",
+    "TEST_END_DATE": "2025-12-31",
     "FORECAST_START_2026": "2026-01-01",
     "FORECAST_END_2026": "2026-12-31",
 
@@ -61,6 +68,7 @@ CONFIG = {
     # Construction intensity threshold for "high-construction" analysis
     "HIGH_CONSTR_THRESHOLD": 5.0,
 }
+
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
@@ -89,45 +97,66 @@ def rmse(y_true, y_pred):
 def load_and_prepare_311(config: dict) -> pd.DataFrame:
     print_section("Loading & preprocessing NYC 311 noise data (ZIP level)")
 
-    path = config["NYC311_PATH"]
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"311 file not found at {path}")
+    paths = config.get("NYC311_PATHS")
+    single_path = config.get("NYC311_PATH")
 
-    df = pd.read_csv(path, low_memory=False)
-    print(f"Raw 311 shape: {df.shape}")
+    if paths is None and single_path is None:
+        raise ValueError("Please set either NYC311_PATHS (list) or NYC311_PATH in CONFIG.")
 
-    # normalize column names to lower-case
-    df.columns = [c.strip().lower() for c in df.columns]
+    dfs = []
 
-    col_created = config["COL_CREATED_DATE"].lower()
-    col_boro = config["COL_BOROUGH"].lower()
-    col_type = config["COL_COMPLAINT_TYPE"].lower()
-    col_zip = config["COL_ZIP"].lower()
+    # helper to load one file
+    def _load_one(path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"311 file not found at {path}")
+        print(f"  -> Reading {path} ...")
+        df = pd.read_csv(path, low_memory=False)
+        print(f"     Raw shape: {df.shape}")
 
-    for col in [col_created, col_boro, col_type, col_zip]:
-        if col not in df.columns:
-            raise KeyError(f"Column '{col}' not found in 311 data.")
+        # normalize column names
+        df.columns = [c.strip().lower() for c in df.columns]
+        col_created = config["COL_CREATED_DATE"].lower()
+        col_boro = config["COL_BOROUGH"].lower()
+        col_type = config["COL_COMPLAINT_TYPE"].lower()
+        col_zip = config["COL_ZIP"].lower()
 
-    # filter noise complaints
-    noise_keyword = config["NOISE_KEYWORD"].lower()
-    df = df[df[col_type].str.contains(noise_keyword, case=False, na=False)].copy()
-    print(f"After filtering to noise complaints: {df.shape}")
+        # keep only the columns we actually need
+        needed = [col_created, col_boro, col_zip, col_type]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            raise KeyError(f"Columns {missing} not found in 311 file {path}")
+        df = df[needed]
 
-    # drop rows without key fields
-    df = df.dropna(subset=[col_created, col_boro, col_zip])
+        # (optional) filter – safe even if all rows are noise already
+        noise_keyword = config["NOISE_KEYWORD"].lower()
+        df = df[df[col_type].str.contains(noise_keyword, case=False, na=False)].copy()
 
-    # parse datetime
-    df["created_dt"] = safe_parse_datetime(df[col_created])
-    df = df.dropna(subset=["created_dt"])
+        # drop nulls
+        df = df.dropna(subset=[col_created, col_boro, col_zip])
 
-    # normalize borough, zip
-    df["borough"] = df[col_boro].astype(str).str.strip().str.upper()
-    df["zip"] = df[col_zip].astype(str).str.extract(r"(\d+)")[0].str.zfill(5)
+        # parse datetime
+        df["created_dt"] = safe_parse_datetime(df[col_created])
+        df = df.dropna(subset=["created_dt"])
+
+        # normalize borough, zip
+        df["borough"] = df[col_boro].astype(str).str.strip().str.upper()
+        df["zip"] = df[col_zip].astype(str).str.extract(r"(\d+)")[0].str.zfill(5)
+
+        return df
+
+    if paths is not None:
+        for p in paths:
+            dfs.append(_load_one(p))
+        df_all = pd.concat(dfs, ignore_index=True)
+    else:
+        df_all = _load_one(single_path)
+
+    print(f"Total combined 311 noise shape: {df_all.shape}")
 
     # aggregate to hourly ZIP counts per borough
-    df["created_dt_hour"] = df["created_dt"].dt.floor("h")
+    df_all["created_dt_hour"] = df_all["created_dt"].dt.floor("h")
     agg = (
-        df.groupby(["borough", "zip", "created_dt_hour"])
+        df_all.groupby(["borough", "zip", "created_dt_hour"])
         .size()
         .reset_index(name="noise_count")
     )
@@ -635,58 +664,69 @@ def build_2026_feature_grid(dob_daily, config):
 
 
 def forecast_2026(grid_2026, models_dict):
-    print_section("Forecasting 2026 with CANSF (ZIP level)")
+    print_section("Forecasting 2026 with CANSF (ZIP level, daily ZIP outputs)")
 
     base_model = models_dict["base_model"]
     resid_model = models_dict["resid_model"]
     base_feats = models_dict["base_features"]
     resid_feats = models_dict["resid_features"]
 
-    # -------------------- FIX LAG FEATURES --------------------
-    # XGBoost requires lag_1 and lag_24 because they were used in training.
+    # Ensure lag features exist with neutral placeholders for future data
     for lag in [1, 24]:
         lag_col = f"lag_{lag}"
         if lag_col not in grid_2026.columns:
             grid_2026[lag_col] = 0.0
 
-    # drop lag features for forward-only forecast
-    # KEEP all base features (including lag_1 and lag_24)  
-    base_feats_forecast = base_feats  
-
-# Ensure grid includes the lag columns  
-    for lag in [1, 24]:
-        lag_col = f"lag_{lag}"
-        if lag_col not in grid_2026.columns:
-            grid_2026[lag_col] = 0.0
-
+    # Use the same full feature sets as training (including lag_1, lag_24)
+    base_feats_forecast = base_feats
     resid_feats_forecast = [f for f in resid_feats if f in grid_2026.columns]
 
     print("Base features used for 2026:", base_feats_forecast)
     print("Residual features used for 2026:", resid_feats_forecast)
 
+    # ---------- Stage 1 + Stage 2 hourly predictions ----------
     base_pred_2026 = base_model.predict(grid_2026[base_feats_forecast])
     resid_pred_2026 = resid_model.predict(grid_2026[resid_feats_forecast])
     final_pred_2026 = base_pred_2026 + resid_pred_2026
 
     grid_2026["pred_noise_count"] = final_pred_2026
 
-    summary = (
-        grid_2026.groupby(["borough", "zip"])["pred_noise_count"]
-        .agg(["mean", "max", "sum"])
+    # Add date column for daily aggregation
+    grid_2026["date"] = grid_2026["created_dt_hour"].dt.normalize()
+
+    # ---------- ZIP-level DAILY totals ----------
+    daily_zip = (
+        grid_2026.groupby(["borough", "zip", "date"])["pred_noise_count"]
+        .sum()
         .reset_index()
-        .rename(columns={"mean": "avg_hourly", "max": "peak_hourly", "sum": "total_2026"})
+        .rename(columns={"pred_noise_count": "daily_total_noise"})
     )
 
-    print("\n2026 forecast summary (top 10 ZIPs by total complaints):")
-    print(summary.sort_values("total_2026", ascending=False).head(10))
+    # Optionally, also create per-ZIP 2026 summary
+    summary_zip = (
+        daily_zip.groupby(["borough", "zip"])["daily_total_noise"]
+        .agg(["mean", "max", "sum"])
+        .reset_index()
+        .rename(columns={
+            "mean": "avg_daily",
+            "max": "peak_daily",
+            "sum": "total_2026"
+        })
+    )
 
-    grid_2026.to_csv("predictions_2026_zip_hourly.csv", index=False)
-    summary.to_csv("predictions_2026_summary_by_zip.csv", index=False)
+    print("\n2026 daily ZIP forecast summary (top 10 ZIPs by total complaints):")
+    print(summary_zip.sort_values("total_2026", ascending=False).head(10))
+
+    # ---------- Save compact outputs ----------
+    daily_zip.to_csv("predictions_2026_zip_daily.csv", index=False)
+    summary_zip.to_csv("predictions_2026_summary_by_zip.csv", index=False)
+
     print("\nSaved 2026 predictions to:")
-    print("- predictions_2026_zip_hourly.csv")
-    print("- predictions_2026_summary_by_zip.csv")
+    print("- predictions_2026_zip_daily.csv   (borough, zip, date, daily_total_noise)")
+    print("- predictions_2026_summary_by_zip.csv  (one row per ZIP)")
 
-    return grid_2026, summary
+    return daily_zip, summary_zip
+
 
 
 # ============================================================
